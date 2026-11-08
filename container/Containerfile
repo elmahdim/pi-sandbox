@@ -1,0 +1,7 @@
+FROM docker.io/library/debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash ca-certificates coreutils file findutils git grep ripgrep util-linux \
+    && rm -rf /var/lib/apt/lists/*
+ENV HOME=/tmp/home LANG=C.UTF-8
+WORKDIR /workspace
+CMD ["sleep", "infinity"]
