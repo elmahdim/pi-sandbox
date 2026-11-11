@@ -4,8 +4,8 @@ import {
   createBashToolDefinition, createReadToolDefinition, createWriteToolDefinition, createEditToolDefinition,
   type BashOperations, type ExtensionAPI, type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Sandbox, DEFAULT_IMAGE, LABEL, checked, containerPath, runPodman, type Network } from "./runtime.ts";
-import { sandboxView } from "./ui.ts";
+import { Sandbox, DEFAULT_IMAGE, LABEL, checked, containerPath, runPodman, stopAll, isStarted, type Network } from "./runtime.ts";
+import { sandboxView, spinnerLine } from "./ui.ts";
 
 const TOOLS = ["read", "write", "edit", "bash"];
 const HELP = "Usage: /sandbox start | stop | status | build | network on|off | cleanup";
@@ -16,13 +16,26 @@ export default function (pi: ExtensionAPI) {
     if (!sandbox) throw new Error("Sandbox not initialized; host fallback is disabled");
     return sandbox;
   };
+  let spinner: ReturnType<typeof setInterval> | undefined;
+  let frame = 0;
+  const stopSpinner = () => { if (spinner) { clearInterval(spinner); spinner = undefined; } };
+  const render = (ctx: ExtensionContext, line: string, color: string) => {
+    // Single informative line above the editor; full boundary lives in `/sandbox status`.
+    // No footer entry — the aboveEditor widget is the only persistent indicator.
+    ctx.ui.setWidget("pi-sandbox", [ctx.ui.theme.fg(color, line)], { placement: "aboveEditor" });
+  };
   const status = (ctx: ExtensionContext, activity?: string) => {
     if (!ctx.hasUI) return;
-    const view = sandboxView(sandbox, activity);
-    const color = view.running ? "success" : "warning";
-    ctx.ui.setStatus("pi-sandbox", view.footer ? ctx.ui.theme.fg("success", view.footer) : undefined);
-    ctx.ui.setWidget("pi-sandbox", view.lines.map((line, index) =>
-      ctx.ui.theme.fg(index === (activity ? 1 : 0) ? color : "muted", line)), { placement: "aboveEditor" });
+    stopSpinner();
+    if (activity) {
+      // Animate a rotating cube while the operation is in flight.
+      frame = 0;
+      render(ctx, spinnerLine(frame, activity), "muted");
+      spinner = setInterval(() => render(ctx, spinnerLine(++frame, activity), "muted"), 120);
+      return;
+    }
+    const view = sandboxView(sandbox);
+    render(ctx, view.widget, view.running ? "success" : "warning");
   };
   pi.registerFlag("sandbox-auto-start", { description: "Start the sandbox at session startup", type: "boolean", default: false });
   pi.registerFlag("sandbox-image", { description: "Prebuilt Podman image (must include bash, coreutils and file)", type: "string", default: DEFAULT_IMAGE });
@@ -116,19 +129,34 @@ export default function (pi: ExtensionAPI) {
     const project = await realpath(ctx.cwd);
     const network = pi.getFlag("sandbox-network");
     if (network !== "on" && network !== "off") throw new Error("--sandbox-network must be on or off");
-    sandbox = new Sandbox(project, String(pi.getFlag("sandbox-image") ?? DEFAULT_IMAGE), network as Network);
+    sandbox = new Sandbox(project, String(pi.getFlag("sandbox-image") ?? DEFAULT_IMAGE), network as Network, runPodman, ctx.sessionManager.getSessionId());
     pi.setActiveTools(TOOLS);
     status(ctx);
-    if (pi.getFlag("sandbox-auto-start")) {
+    // A switch or reload within this process preserves the container; reattach to it
+    // instead of making a new one. Only probe Podman when this process already owns a
+    // container for this session, so a plain startup stays side-effect free.
+    if (isStarted(sandbox.containerName)) {
+      try { await sandbox.adopt(); } catch { /* fall through to a fresh start */ }
+    }
+    if (!sandbox.name && pi.getFlag("sandbox-auto-start")) {
       status(ctx, "Starting sandbox…");
       try { await sandbox.start(); }
       catch (error) { ctx.ui.notify(`Sandbox startup failed; tools blocked: ${error}`, "error"); }
-      status(ctx);
-    } else if (ctx.hasUI) ctx.ui.notify("pi-sandbox loaded; tools blocked until /sandbox start. First use: /sandbox build", "info");
+    } else if (!sandbox.name && ctx.hasUI) {
+      ctx.ui.notify("pi-sandbox loaded; tools blocked until /sandbox start. First use: /sandbox build", "info");
+    }
+    status(ctx);
   });
-  pi.on("session_shutdown", async (_event, ctx) => {
-    try { await sandbox?.stop(); }
+  pi.on("session_shutdown", async (event, ctx) => {
+    // Only a real exit tears containers down. Session switches and reloads keep this
+    // session's container running so returning to it reattaches without a restart, and
+    // so other sessions' sandboxes keep running in parallel, undisturbed.
+    try {
+      if (event.reason === "quit") { await sandbox?.stop(); await stopAll(); }
+      else sandbox?.detach();
+    }
     finally {
+      stopSpinner();
       if (ctx.hasUI) {
         ctx.ui.setStatus("pi-sandbox", undefined);
         ctx.ui.setWidget("pi-sandbox", undefined);

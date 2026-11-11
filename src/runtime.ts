@@ -61,11 +61,26 @@ export function containerPath(path: string, project: string): string {
   return path;
 }
 
+// Containers this host process created or adopted. Removed together on a real quit so
+// sandboxes left running by session switches (which deliberately preserve them) never
+// outlive the Pi process that owns them.
+const started = new Set<string>();
+export function isStarted(name: string) { return started.has(name); }
+export async function stopAll(run: Runner = runPodman) {
+  const names = [...started];
+  started.clear();
+  for (const name of names) {
+    await run(["rm", "--force", "--ignore", name], { timeoutMs: 15_000 }).catch(() => {});
+  }
+}
+
 export function runArgs(name: string, project: string, image: string, network: Network): string[] {
   if (project === "/" || project === homedir()) throw new Error("Refusing to mount your home directory or filesystem root");
   if (/[,:\n\r]/.test(project)) throw new Error("Project paths containing commas, colons or newlines are unsupported");
   if (!image || image.startsWith("-")) throw new Error("Invalid sandbox image");
-  return ["run", "--detach", "--rm", "--pull=never", "--name", name, "--label", LABEL,
+  // --replace clears a same-named leftover (e.g. an exited container a crash left behind)
+  // without a separate list/remove round-trip; adoption handles still-running ones first.
+  return ["run", "--detach", "--rm", "--replace", "--pull=never", "--name", name, "--label", LABEL,
     "--label", `io.pi-sandbox.created=${Date.now()}`, "--userns=keep-id",
     "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
     "--pids-limit=256", "--memory=1g", "--cpus=2", "--network", network === "off" ? "none" : "bridge",
@@ -77,18 +92,42 @@ export function runArgs(name: string, project: string, image: string, network: N
 export class Sandbox {
   name: string | undefined;
   private leftover: string | undefined;
-  constructor(public project: string, public image = DEFAULT_IMAGE, public network: Network = "on", public run: Runner = runPodman) {
+  // Derived from the session id so the same session reattaches to the same container
+  // across switches and reloads, while distinct sessions never collide.
+  readonly containerName: string;
+  constructor(public project: string, public image = DEFAULT_IMAGE, public network: Network = "on", public run: Runner = runPodman, public id: string = randomUUID()) {
     this.project = resolve(project);
+    this.containerName = `pi-sandbox-${id}`;
+  }
+  // Reattach to this session's container if it is still running (e.g. after switching
+  // away and back). Returns true when adopted. Never creates or mutates a container.
+  async adopt(): Promise<boolean> {
+    if (this.name) return true;
+    const name = this.containerName;
+    const result = await this.run(["inspect", "--format", "{{.State.Running}}", name]).catch(() => undefined);
+    if (result?.code === 0 && result.stdout.toString().trim() === "true") {
+      this.name = name;
+      this.leftover = undefined;
+      started.add(name);
+      return true;
+    }
+    return false;
+  }
+  // Forget the local binding without touching Podman, leaving the container running so a
+  // later session_start can adopt it. Used for session switches, not for a real shutdown.
+  detach() {
+    this.name = undefined;
+    this.leftover = undefined;
   }
   async start() {
     if (this.name) return;
-    if (this.leftover) await this.stop();
-    const name = `pi-sandbox-${randomUUID()}`;
+    const name = this.containerName;
     const args = runArgs(name, this.project, this.image, this.network);
     this.leftover = name;
     try {
       checked(await this.run(args));
       this.name = name;
+      started.add(name);
     } catch (error) {
       await this.stop().catch(() => {});
       if (/image not known|image not found|no such image/i.test(String(error))) {
@@ -102,6 +141,7 @@ export class Sandbox {
     this.name = undefined; // Fail closed even if removal fails.
     if (!name) return;
     this.leftover = name;
+    started.delete(name);
     checked(await this.run(["rm", "--force", "--ignore", name], { timeoutMs: 15_000 }));
     this.leftover = undefined;
   }

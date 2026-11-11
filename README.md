@@ -117,29 +117,35 @@ Start a new Pi session, or run `/reload` in an existing one. You still need `/sa
 | `/sandbox network on` | Enable standard bridge networking; recreate a running sandbox |
 | `/sandbox cleanup` | Confirm removal of exited containers labeled as managed by this package |
 
-Normal exit, reload, and session replacement remove the current container. Live project changes survive. Temporary files, installed temporary tools, and background processes do not. A crash or killed host process may leave a **running** container: inspect it with `podman ps --filter label=io.pi-sandbox.managed=1` and explicitly remove the chosen container with `podman rm -f <name>`. Cleanup deliberately does not kill running containers, including those belonging to other Pi sessions.
+Each session gets its own container, named after the session id. Switching between sessions (`/new`, `/resume`) and reloading (`/reload`) keep that container **running**, so returning to a session reattaches to it instead of starting over, and sessions you switch away from keep running in parallel, undisturbed. Use `/sandbox stop` to remove a session's container on demand. Quitting Pi removes every container this process started; live project changes survive, but temporary files, installed temporary tools, and background processes do not. A crash or killed host process may leave a **running** container: inspect it with `podman ps --filter label=io.pi-sandbox.managed=1` and explicitly remove the chosen container with `podman rm -f <name>`, or run `/sandbox cleanup`. Cleanup deliberately does not kill running containers, including those belonging to other Pi sessions.
 
 No global prune, image deletion, volume deletion, or automatic disk-image shrinking is performed.
 
 ## Workspace indicator
 
-An above-editor panel makes the execution boundary visible:
+A single above-editor line keeps the execution boundary visible without crowding the prompt:
 
 ```text
-SANDBOX ACTIVE · workspace tools execute in Podman
-Project: /your/project → /workspace · LIVE read-write
-Network: ON — internet / LAN access allowed · Image: localhost/pi-sandbox:0.1
-Container: pi-sandbox-… · Pi + provider authentication stay on host
+📦 sandbox online · net on · rw · agent-isolated
 ```
 
-A compact sandbox footer entry is present **only while active**. Stopping removes that entry and replaces the panel with:
+A compact sandbox footer entry is present **only while active**. Stopping collapses the line to:
 
 ```text
-SANDBOX OFF · agent tools blocked — no host fallback
-Pi is on the host · /sandbox start to enable sandbox tools
+📦 sandbox offline · tools locked, no host fallback · /sandbox start
 ```
 
-The panel also shows progress while starting, stopping, building, or changing network mode. Cancellation/failure updates the indicator after the tool completes. `/sandbox status` queries Podman for an explicit container health check; the panel reflects session-managed state, not a background health poll. Shutdown clears both the panel and this extension's footer entry without replacing Pi's normal footer.
+Run `/sandbox status` for the full boundary — execution location, live mount, network, image, container, and where Pi plus provider authentication stay:
+
+```text
+Sandbox: running
+Project: /your/project → /workspace (read-write)
+Image: localhost/pi-sandbox:0.1
+Network: on
+Container: pi-sandbox-…
+```
+
+The line also shows progress while starting, stopping, building, or changing network mode, animated with a rotating-cube spinner (`◰ ◳ ◲ ◱`). Cancellation/failure updates the indicator after the tool completes. `/sandbox status` queries Podman for an explicit container health check; the line reflects session-managed state, not a background health poll. Shutdown clears both the line and this extension's footer entry without replacing Pi's normal footer.
 
 ## Startup flags
 

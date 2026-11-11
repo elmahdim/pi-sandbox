@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { homedir } from "node:os";
-import { Sandbox, containerPath, runArgs, checked, type Runner, type RunResult } from "../src/runtime.ts";
+import { Sandbox, containerPath, runArgs, checked, isStarted, stopAll, type Runner, type RunResult } from "../src/runtime.ts";
 
 const ok = (text = ""): RunResult => ({ stdout: Buffer.from(text), stderr: Buffer.alloc(0), code: 0 });
 
@@ -99,6 +99,39 @@ test("failed removal is remembered for retry but execution stays blocked", async
   await s.start(); await assert.rejects(s.stop());
   assert.equal(s.name, undefined);
   await s.stop(); assert.equal(removals, 2);
+});
+
+test("container name is stable per session id so a session reattaches to its own container", async () => {
+  const calls: string[][] = [];
+  const runner: Runner = async (args) => { calls.push(args); return ok("true"); };
+  // A fresh instance for the same session (e.g. after switching away and back) adopts
+  // the already-running container instead of creating a second one.
+  const first = new Sandbox("/project", "image", "off", runner, "abc");
+  await first.start();
+  assert.equal(first.name, "pi-sandbox-abc");
+  assert.ok(isStarted("pi-sandbox-abc"));
+  first.detach(); // session switch preserves the container
+  assert.equal(first.name, undefined);
+  assert.ok(isStarted("pi-sandbox-abc")); // still tracked and running
+
+  const resumed = new Sandbox("/project", "image", "off", runner, "abc");
+  assert.equal(await resumed.adopt(), true);
+  assert.equal(resumed.name, "pi-sandbox-abc");
+  assert.ok(calls.some((a) => a[0] === "inspect"));
+  assert.equal(calls.filter((a) => a[0] === "run").length, 1); // no second container created
+
+  // Distinct sessions never collide.
+  const other = new Sandbox("/project", "image", "off", runner, "xyz");
+  assert.equal(other.containerName, "pi-sandbox-xyz");
+  await stopAll(runner);
+  assert.equal(isStarted("pi-sandbox-abc"), false);
+});
+
+test("adopt ignores a container that is not running and never binds it", async () => {
+  const s = new Sandbox("/project", "image", "off", async () => ok("false"), "gone");
+  assert.equal(await s.adopt(), false);
+  assert.equal(s.name, undefined);
+  assert.equal(isStarted("pi-sandbox-gone"), false);
 });
 
 test("nonzero command exit is returned without destroying sandbox", async () => {

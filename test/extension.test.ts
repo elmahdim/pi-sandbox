@@ -20,7 +20,8 @@ function harness() {
   extension(pi as unknown as ExtensionAPI);
   return { handlers, tools, flags, commands, active: () => active };
 }
-const ctx = () => ({ cwd: process.cwd(), hasUI: false, ui: { setStatus() {}, notify() {} } });
+const sessionManager = { getSessionId: () => "test-session" };
+const ctx = () => ({ cwd: process.cwd(), hasUI: false, sessionManager, ui: { setStatus() {}, notify() {} } });
 
 test("only four sandbox-backed tools are registered; stopped calls fail closed", async () => {
   const h = harness();
@@ -47,7 +48,7 @@ test("stop clears sandbox footer, shows OFF boundary indicator; shutdown clears 
   const widgets: Array<string[] | undefined> = [];
   const notifications: string[] = [];
   const context = {
-    cwd: process.cwd(), hasUI: true, isIdle: () => true,
+    cwd: process.cwd(), hasUI: true, isIdle: () => true, sessionManager,
     ui: {
       theme: { fg: (_color: string, text: string) => text },
       setStatus: (_key: string, value: string | undefined) => statuses.push(value),
