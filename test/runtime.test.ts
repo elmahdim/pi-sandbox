@@ -72,7 +72,7 @@ test("missing image gives build instructions, without auto-pulling or executing 
       ? { ...ok(), code: 125, stderr: Buffer.from("Error: localhost/pi-sandbox:0.1: image not known") }
       : ok();
   });
-  await assert.rejects(s.start(), /Run \/sandbox build, then \/sandbox start/);
+  await assert.rejects(s.start(), /Open \/sandbox and choose Build\/rebuild image/);
   assert.equal(s.name, undefined);
 });
 

@@ -1,163 +1,136 @@
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { resolve, relative, isAbsolute } from "node:path";
+import { createBackend, DEFAULT_IMAGE, MissingImageError, type Network, type RuntimeBackend, type RuntimeName, type ResourceStats } from "./backends.ts";
+import { checked, type Runner, type RunOptions, type RunResult } from "./process.ts";
+export { DEFAULT_IMAGE, LABEL, runArgs, parseRuntime, type Network, type RuntimeName } from "./backends.ts";
+export { checked, runPodman, runApple, type Runner, type RunOptions, type RunResult } from "./process.ts";
 
-export const LABEL = "io.pi-sandbox.managed=1";
-export const DEFAULT_IMAGE = "localhost/pi-sandbox:0.1";
-export type Network = "on" | "off";
-export interface RunOptions {
-  input?: string;
-  signal?: AbortSignal;
-  timeoutMs?: number;
-  onData?: (data: Buffer) => void;
-  maxBytes?: number;
-}
-export interface RunResult { stdout: Buffer; stderr: Buffer; code: number }
-export type Runner = (args: string[], options?: RunOptions) => Promise<RunResult>;
-
-// No shell on the host. Only the fixed Podman executable receives arguments.
-export const runPodman: Runner = (args, options = {}) => new Promise((resolveResult, reject) => {
-  if (options.signal?.aborted) return reject(new Error("Cancelled"));
-  const child = spawn("podman", args, { stdio: ["pipe", "pipe", "pipe"] });
-  const stdout: Buffer[] = [], stderr: Buffer[] = [];
-  let size = 0, failure: Error | undefined;
-  const stop = (error: Error) => { failure ??= error; child.kill("SIGKILL"); };
-  const abort = () => stop(new Error("Cancelled"));
-  options.signal?.addEventListener("abort", abort, { once: true });
-  const timer = setTimeout(() => stop(new Error("Podman operation timed out")), options.timeoutMs ?? 60_000);
-  const collect = (chunks: Buffer[]) => (chunk: Buffer) => {
-    size += chunk.length;
-    if (size > (options.maxBytes ?? 32 * 1024 * 1024)) {
-      stop(new Error("Podman output exceeded safety limit")); return;
-    }
-    if (options.onData) options.onData(chunk); else chunks.push(chunk);
-  };
-  child.stdout.on("data", collect(stdout));
-  child.stderr.on("data", collect(stderr));
-  child.stdin.on("error", () => {}); // Early exit can close stdin before a write completes.
-  child.stdin.end(options.input);
-  child.on("error", (error) => { failure = error; });
-  child.on("close", (code) => {
-    clearTimeout(timer);
-    options.signal?.removeEventListener("abort", abort);
-    if (failure) reject(failure);
-    else resolveResult({ stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr), code: code ?? 1 });
-  });
-});
-
-export function checked(result: RunResult): Buffer {
-  if (result.code !== 0) throw new Error(`Podman failed (${result.code}): ${result.stderr.toString().trim()}`);
-  return result.stdout;
-}
-
-// Translate only an exact project prefix, never arbitrary substring matches.
-// Other absolute paths refer to the CONTAINER filesystem, not the host.
+// Translate only an exact project prefix. Other absolute paths are container paths.
 export function containerPath(path: string, project: string): string {
   const rel = relative(project, path);
-  if (rel === "" || (!rel.startsWith(".." + "/") && rel !== ".." && !isAbsolute(rel))) {
+  if (rel === "" || (!rel.startsWith("../") && rel !== ".." && !isAbsolute(rel))) {
     return rel ? `/workspace/${rel}` : "/workspace";
   }
   return path;
 }
-
-// Containers this host process created or adopted. Removed together on a real quit so
-// sandboxes left running by session switches (which deliberately preserve them) never
-// outlive the Pi process that owns them.
-const started = new Set<string>();
-export function isStarted(name: string) { return started.has(name); }
-export async function stopAll(run: Runner = runPodman) {
-  const names = [...started];
-  started.clear();
-  for (const name of names) {
-    await run(["rm", "--force", "--ignore", name], { timeoutMs: 15_000 }).catch(() => {});
+interface OwnedContainer { name: string; backend: RuntimeBackend; config: string }
+const started = new Map<string, OwnedContainer>();
+const key = (name: string, runtime: RuntimeName) => `${runtime}:${name}`;
+export function isStarted(name: string, runtime: RuntimeName = "podman") { return started.has(key(name, runtime)); }
+export async function stopAll(run?: Runner) {
+  for (const [id, owned] of [...started]) {
+    try {
+      await (run ? createBackend(owned.backend.id, run) : owned.backend).remove(owned.name);
+      started.delete(id);
+    } catch { /* Keep failed removals tracked for another cleanup attempt. */ }
   }
-}
-
-export function runArgs(name: string, project: string, image: string, network: Network): string[] {
-  if (project === "/" || project === homedir()) throw new Error("Refusing to mount your home directory or filesystem root");
-  if (/[,:\n\r]/.test(project)) throw new Error("Project paths containing commas, colons or newlines are unsupported");
-  if (!image || image.startsWith("-")) throw new Error("Invalid sandbox image");
-  // --replace clears a same-named leftover (e.g. an exited container a crash left behind)
-  // without a separate list/remove round-trip; adoption handles still-running ones first.
-  return ["run", "--detach", "--rm", "--replace", "--pull=never", "--name", name, "--label", LABEL,
-    "--label", `io.pi-sandbox.created=${Date.now()}`, "--userns=keep-id",
-    "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
-    "--pids-limit=256", "--memory=1g", "--cpus=2", "--network", network === "off" ? "none" : "bridge",
-    "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777", "--env", "HOME=/tmp/home",
-    "--mount", `type=bind,source=${project},target=/workspace`, "--workdir", "/workspace",
-    "--entrypoint", "/bin/sh", image, "-c", "mkdir -p /tmp/home && exec sleep infinity"];
 }
 
 export class Sandbox {
   name: string | undefined;
   private leftover: string | undefined;
-  // Derived from the session id so the same session reattaches to the same container
-  // across switches and reloads, while distinct sessions never collide.
+  private generation = 0;
+  metrics: ResourceStats | undefined;
+  metricsState: "pending" | "available" | "unavailable" = "pending";
+  startDurationMs: number | undefined;
   readonly containerName: string;
-  constructor(public project: string, public image = DEFAULT_IMAGE, public network: Network = "on", public run: Runner = runPodman, public id: string = randomUUID()) {
+  readonly backend: RuntimeBackend;
+  readonly run: Runner;
+  constructor(public project: string, public image = DEFAULT_IMAGE, public network: Network = "on", run?: Runner,
+    public readonly id: string = randomUUID(), public readonly runtime: RuntimeName = "podman") {
     this.project = resolve(project);
-    this.containerName = `pi-sandbox-${id}`;
+    this.backend = createBackend(runtime, run);
+    this.run = this.backend.run;
+    // Preserve existing Podman session names; isolate Apple names and ownership too.
+    this.containerName = `pi-sandbox-${runtime === "apple" ? "apple-" : ""}${id}`;
   }
-  // Reattach to this session's container if it is still running (e.g. after switching
-  // away and back). Returns true when adopted. Never creates or mutates a container.
+  private configKey() { return JSON.stringify([this.project, this.image, this.network]); }
+  private track(name: string) { started.set(key(name, this.runtime), { name, backend: this.backend, config: this.configKey() }); }
   async adopt(): Promise<boolean> {
     if (this.name) return true;
-    const name = this.containerName;
-    const result = await this.run(["inspect", "--format", "{{.State.Running}}", name]).catch(() => undefined);
-    if (result?.code === 0 && result.stdout.toString().trim() === "true") {
-      this.name = name;
+    const owned = started.get(key(this.containerName, this.runtime));
+    if (owned && owned.config !== this.configKey()) throw new Error("Sandbox configuration changed; stop/recreate it before reattaching");
+    if (await this.backend.inspect(this.containerName) === "running") {
+      this.name = this.containerName;
       this.leftover = undefined;
-      started.add(name);
+      this.track(this.name);
       return true;
     }
     return false;
   }
-  // Forget the local binding without touching Podman, leaving the container running so a
-  // later session_start can adopt it. Used for session switches, not for a real shutdown.
+  private resetMetrics() {
+    this.generation++;
+    this.metrics = undefined;
+    this.metricsState = "pending";
+  }
   detach() {
     this.name = undefined;
     this.leftover = undefined;
+    this.resetMetrics();
   }
   async start() {
     if (this.name) return;
     const name = this.containerName;
-    const args = runArgs(name, this.project, this.image, this.network);
+    const args = this.backend.runArgs({ name, project: this.project, image: this.image, network: this.network });
+    await this.backend.prepare(this.image);
+    // Apple has neither --replace nor --ignore; never force-remove a name collision.
+    if (this.runtime === "apple") await this.backend.remove(name, false);
     this.leftover = name;
+    this.resetMetrics();
+    const begin = performance.now();
     try {
-      checked(await this.run(args));
+      checked(await this.run(args), this.backend.label);
       this.name = name;
-      started.add(name);
+      this.startDurationMs = performance.now() - begin;
+      this.track(name);
     } catch (error) {
       await this.stop().catch(() => {});
       if (/image not known|image not found|no such image/i.test(String(error))) {
-        throw new Error(`Sandbox image ${this.image} is not available locally. Run /sandbox build, then /sandbox start. Images are shared across project directories.`, { cause: error });
+        throw new MissingImageError(this.image);
       }
       throw error;
     }
   }
   async stop() {
-    const name = this.name ?? this.leftover;
+    // An owned container with changed startup settings may be deliberately unadopted.
+    // Explicit stop must still be able to remove it without enabling tools first.
+    const name = this.name ?? this.leftover ?? (isStarted(this.containerName, this.runtime) ? this.containerName : undefined);
     this.name = undefined; // Fail closed even if removal fails.
+    this.resetMetrics();
+    this.startDurationMs = undefined;
     if (!name) return;
     this.leftover = name;
-    started.delete(name);
-    checked(await this.run(["rm", "--force", "--ignore", name], { timeoutMs: 15_000 }));
+    await this.backend.remove(name);
+    started.delete(key(name, this.runtime));
     this.leftover = undefined;
+  }
+  async refreshMetrics(signal?: AbortSignal) {
+    const name = this.name, generation = this.generation;
+    if (!name) return;
+    try {
+      const metrics = await this.backend.stats(name, signal);
+      if (generation !== this.generation || signal?.aborted) return;
+      this.metrics = metrics;
+      this.metricsState = "available";
+    } catch {
+      // Observability failure must never destroy a working sandbox or keep stale data.
+      if (generation !== this.generation || signal?.aborted) return;
+      this.metrics = undefined;
+      this.metricsState = "unavailable";
+    }
   }
   async exec(argv: string[], options: RunOptions = {}, cwd = "/workspace"): Promise<RunResult> {
     const name = this.name;
     if (!name) throw new Error("Sandbox stopped. Run /sandbox start. Host fallback is disabled.");
     try {
-      return await this.run(["exec", "--interactive", "--workdir", containerPath(cwd, this.project), name, ...argv], options);
+      return await this.run(this.backend.execArgs(name, containerPath(cwd, this.project), argv), options);
     } catch (error) {
-      // Killing the host CLI does NOT guarantee container processes stop.
-      // Destroy the entire sandbox on cancellation, deadline or transport failure.
+      // Killing the host CLI does not guarantee container-side descendants stop.
       await this.stop().catch(() => {});
       throw error;
     }
   }
   async file(argv: string[], options: RunOptions = {}) {
-    return checked(await this.exec(argv, options));
+    return checked(await this.exec(argv, options), this.backend.label);
   }
 }

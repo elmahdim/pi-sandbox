@@ -1,7 +1,7 @@
 {
   "name": "pi-sandbox",
   "version": "0.1.0",
-  "description": "Podman sandbox execution for host-side Pi",
+  "description": "Podman and Apple Container sandbox execution for host-side Pi",
   "type": "module",
   "keywords": ["pi-package"],
   "license": "MIT",
